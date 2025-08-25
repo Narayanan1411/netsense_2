@@ -283,6 +283,7 @@ class NetworkOptimizer:
         self.max_drive_min = max_drive_min
         self.min_coverage_pct = min_coverage_pct
         self.min_avg_rating = min_avg_rating
+        self.progress_handler = None
         
     def optimize(self, members: pd.DataFrame, providers: pd.DataFrame) -> Dict[str, Any]:
         """Main optimization function"""
@@ -393,8 +394,11 @@ class NetworkOptimizer:
                 current_providers_set = trial_providers_set
                 removed_pids.append(pid_to_remove)
                 
-                if i % 10 == 0:  # Log progress periodically
-                    logger.info(f"Removed provider {pid_to_remove}. New cost: ${trial_kpi['total_cost']:,.2f}")
+                # Log progress and update Streamlit if handler available
+                message = f"Removed provider {pid_to_remove}. New cost: ${trial_kpi['total_cost']:,.2f}"
+                logger.info(message)
+                if self.progress_handler:
+                    self.progress_handler.update_progress(message)
         
         # Final evaluation
         final_providers = provider_info.loc[list(current_providers_set)].reset_index()

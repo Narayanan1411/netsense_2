@@ -134,9 +134,10 @@ def run_optimization(provider_file, member_file, max_drive_time, min_coverage, m
                 min_avg_rating=min_rating
             )
             
-            # Run optimization
+            # Run optimization with progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
+            progress_container = st.container()
             
             status_text.text("🔍 Analyzing provider data...")
             progress_bar.progress(20)
@@ -149,6 +150,30 @@ def run_optimization(provider_file, member_file, max_drive_time, min_coverage, m
             
             status_text.text("⚡ Running optimization algorithm...")
             progress_bar.progress(80)
+            
+            # Add a live log container for real-time updates
+            log_container = progress_container.empty()
+            
+            class StreamlitProgressHandler:
+                def __init__(self, log_container, status_text):
+                    self.log_container = log_container
+                    self.status_text = status_text
+                    self.removed_count = 0
+                    self.logs = []
+                
+                def update_progress(self, message):
+                    if "Removed provider" in message:
+                        self.removed_count += 1
+                        self.status_text.text(f"🔧 Optimizing network... Removed {self.removed_count} providers")
+                        # Keep only last 10 log entries
+                        self.logs.append(message)
+                        if len(self.logs) > 10:
+                            self.logs.pop(0)
+                        self.log_container.text("\n".join(self.logs[-5:]))  # Show last 5 entries
+            
+            # Create progress handler and pass to optimizer
+            progress_handler = StreamlitProgressHandler(log_container, status_text)
+            optimizer.progress_handler = progress_handler
             
             results = optimizer.optimize(members_df, providers_df)
             
@@ -303,6 +328,13 @@ def display_geographic_view(results, data):
         st.warning("Provider coordinates not available for geographic visualization")
         return
     
+    # Check for color column (ProviderType vs Type)
+    color_column = None
+    if 'ProviderType' in assigned_providers.columns:
+        color_column = 'ProviderType'
+    elif 'Type' in assigned_providers.columns:
+        color_column = 'Type'
+    
     # Create map - check for correct column names
     hover_columns = []
     if 'ProviderId' in assigned_providers.columns:
@@ -312,17 +344,31 @@ def display_geographic_view(results, data):
     elif 'CMS Rating' in assigned_providers.columns:
         hover_columns.append('CMS Rating')
     
-    fig_map = px.scatter_mapbox(
-        assigned_providers,
-        lat='Latitude',
-        lon='Longitude',
-        color='ProviderType',
-        size='Cost',
-        hover_data=hover_columns,
-        title="Geographic Distribution of Selected Providers",
-        mapbox_style="open-street-map",
-        height=600
-    )
+    # Create the map
+    if color_column:
+        fig_map = px.scatter_mapbox(
+            assigned_providers,
+            lat='Latitude',
+            lon='Longitude',
+            color=color_column,
+            size='Cost',
+            hover_data=hover_columns,
+            title="Geographic Distribution of Selected Providers",
+            mapbox_style="open-street-map",
+            height=600
+        )
+    else:
+        # Fallback without color if no type column available
+        fig_map = px.scatter_mapbox(
+            assigned_providers,
+            lat='Latitude',
+            lon='Longitude',
+            size='Cost',
+            hover_data=hover_columns,
+            title="Geographic Distribution of Selected Providers",
+            mapbox_style="open-street-map",
+            height=600
+        )
     
     fig_map.update_layout(
         mapbox_center_lat=assigned_providers['Latitude'].mean(),
@@ -430,7 +476,7 @@ def display_provider_details(results, data):
         title="Top 15 Providers by Member Assignment",
         labels={'ProviderId': 'Provider ID', 'Members_Assigned': 'Members Assigned'}
     )
-    fig_bar.update_xaxis(tickangle=45)
+    fig_bar.update_layout(xaxis={'tickangle': 45})
     st.plotly_chart(fig_bar, use_container_width=True)
     
     # Detailed provider table
