@@ -241,19 +241,19 @@ def display_results():
             help="Number of providers in optimized network"
         )
     
+    # Before vs After Comparison
+    display_before_after_comparison(results, data)
+    
     # Tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs(["📈 Analytics", "🗺️ Geographic View", "📋 Assignments", "📊 Provider Details"])
+    tab1, tab2, tab3 = st.tabs(["📈 Analytics", "📋 Assignments", "📊 Provider Details"])
     
     with tab1:
         display_analytics(results, data)
     
     with tab2:
-        display_geographic_view(results, data)
-    
-    with tab3:
         display_assignments(results)
     
-    with tab4:
+    with tab3:
         display_provider_details(results, data)
 
 def display_analytics(results, data):
@@ -311,71 +311,151 @@ def display_analytics(results, data):
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
-def display_geographic_view(results, data):
-    """Display geographic visualization of assignments"""
-    assignments = results['final_assignments']
-    providers = data['providers']
-    members = data['members']
+def display_before_after_comparison(results, data):
+    """Display comprehensive before vs after optimization comparison"""
+    st.subheader("🔄 Before vs After Optimization")
     
-    if assignments.empty:
-        st.warning("No assignments to display on map")
-        return
+    # Calculate original network metrics
+    providers_df = data['providers']
+    members_df = data['members']
     
-    # Get assigned providers with coordinates
-    assigned_providers = providers[providers['ProviderId'].isin(assignments['ProviderId'].unique())].copy()
+    # Original network metrics (all providers)
+    original_cost = providers_df['Cost'].sum()
+    original_providers = len(providers_df)
+    original_avg_rating = providers_df['CMS_Rating'].mean()
     
-    if 'Latitude' not in assigned_providers.columns or 'Longitude' not in assigned_providers.columns:
-        st.warning("Provider coordinates not available for geographic visualization")
-        return
+    # Optimized network metrics
+    optimized_cost = results['total_cost']
+    optimized_providers = results['providers_used']
+    optimized_avg_rating = results['avg_rating']
+    optimized_coverage = results['coverage_pct']
     
-    # Check for color column (ProviderType vs Type)
-    color_column = None
-    if 'ProviderType' in assigned_providers.columns:
-        color_column = 'ProviderType'
-    elif 'Type' in assigned_providers.columns:
-        color_column = 'Type'
+    # Calculate savings
+    cost_savings = original_cost - optimized_cost
+    savings_percentage = (cost_savings / original_cost) * 100
+    providers_removed = original_providers - optimized_providers
+    reduction_percentage = (providers_removed / original_providers) * 100
     
-    # Create map - check for correct column names
-    hover_columns = []
-    if 'ProviderId' in assigned_providers.columns:
-        hover_columns.append('ProviderId')
-    if 'CMS_Rating' in assigned_providers.columns:
-        hover_columns.append('CMS_Rating')
-    elif 'CMS Rating' in assigned_providers.columns:
-        hover_columns.append('CMS Rating')
+    # Main comparison metrics
+    col1, col2, col3, col4 = st.columns(4)
     
-    # Create the map using the newer scatter_map function
-    if color_column:
-        fig_map = px.scatter_map(
-            assigned_providers,
-            lat='Latitude',
-            lon='Longitude',
-            color=color_column,
-            size='Cost',
-            hover_data=hover_columns,
-            title="Geographic Distribution of Selected Providers",
-            height=600
+    with col1:
+        st.metric(
+            "Network Cost",
+            f"${optimized_cost:,.0f}",
+            delta=f"-${cost_savings:,.0f} ({savings_percentage:.1f}%)",
+            delta_color="inverse"
         )
+    
+    with col2:
+        st.metric(
+            "Providers Used",
+            f"{optimized_providers}",
+            delta=f"-{providers_removed} ({reduction_percentage:.1f}%)",
+            delta_color="inverse"
+        )
+    
+    with col3:
+        rating_change = optimized_avg_rating - original_avg_rating
+        st.metric(
+            "Average Rating",
+            f"{optimized_avg_rating:.2f}",
+            delta=f"{rating_change:+.2f}",
+            delta_color="normal"
+        )
+    
+    with col4:
+        st.metric(
+            "Member Coverage",
+            f"{optimized_coverage:.1f}%",
+            help="Percentage of members assigned to providers"
+        )
+    
+    # Detailed comparison charts
+    st.subheader("📊 Detailed Comparison")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Cost comparison bar chart
+        comparison_data = {
+            'Network': ['Original', 'Optimized'],
+            'Cost': [original_cost, optimized_cost]
+        }
+        fig_cost = px.bar(
+            comparison_data,
+            x='Network',
+            y='Cost',
+            title="Total Network Cost Comparison",
+            color='Network',
+            color_discrete_map={'Original': '#ff7f7f', 'Optimized': '#7fbf7f'}
+        )
+        fig_cost.update_layout(showlegend=False)
+        st.plotly_chart(fig_cost, use_container_width=True)
+    
+    with col2:
+        # Provider count comparison
+        comparison_providers = {
+            'Network': ['Original', 'Optimized'],
+            'Providers': [original_providers, optimized_providers]
+        }
+        fig_providers = px.bar(
+            comparison_providers,
+            x='Network',
+            y='Providers',
+            title="Provider Count Comparison",
+            color='Network',
+            color_discrete_map={'Original': '#ff7f7f', 'Optimized': '#7fbf7f'}
+        )
+        fig_providers.update_layout(showlegend=False)
+        st.plotly_chart(fig_providers, use_container_width=True)
+    
+    # Summary insights
+    st.subheader("💡 Key Insights")
+    
+    insights = []
+    insights.append(f"**Cost Savings**: Achieved ${cost_savings:,.0f} savings ({savings_percentage:.1f}% reduction)")
+    insights.append(f"**Network Efficiency**: Reduced provider count by {providers_removed} ({reduction_percentage:.1f}%)")
+    
+    if rating_change > 0:
+        insights.append(f"**Quality Improvement**: Average provider rating increased by {rating_change:.2f} points")
+    elif rating_change < -0.1:
+        insights.append(f"**Quality Trade-off**: Average provider rating decreased by {abs(rating_change):.2f} points")
     else:
-        # Fallback without color if no type column available
-        fig_map = px.scatter_map(
-            assigned_providers,
-            lat='Latitude',
-            lon='Longitude',
-            size='Cost',
-            hover_data=hover_columns,
-            title="Geographic Distribution of Selected Providers",
-            height=600
-        )
+        insights.append(f"**Quality Maintained**: Average provider rating remained stable")
     
-    # Center the map on the data
-    fig_map.update_layout(
-        map_center_lat=assigned_providers['Latitude'].mean(),
-        map_center_lon=assigned_providers['Longitude'].mean(),
-        map_zoom=8
-    )
+    insights.append(f"**Coverage**: {optimized_coverage:.1f}% of members successfully assigned to providers")
     
-    st.plotly_chart(fig_map, use_container_width=True)
+    for insight in insights:
+        st.write(f"• {insight}")
+    
+    # Provider type analysis if available
+    assignments = results['final_assignments']
+    if not assignments.empty and 'ProviderType' in assignments.columns:
+        st.subheader("🏥 Provider Type Analysis")
+        
+        # Original provider types
+        original_types = providers_df['ProviderType'].value_counts() if 'ProviderType' in providers_df.columns else None
+        
+        # Optimized provider types
+        optimized_types = assignments['ProviderType'].value_counts()
+        
+        if original_types is not None:
+            # Create comparison dataframe
+            comparison_df = pd.DataFrame({
+                'Original': original_types,
+                'Optimized': optimized_types
+            }).fillna(0)
+            
+            # Provider type comparison chart
+            fig_types = px.bar(
+                comparison_df.reset_index(),
+                x='ProviderType',
+                y=['Original', 'Optimized'],
+                title="Provider Count by Type: Before vs After",
+                barmode='group'
+            )
+            st.plotly_chart(fig_types, use_container_width=True)
 
 def display_assignments(results):
     """Display member-provider assignments table"""
