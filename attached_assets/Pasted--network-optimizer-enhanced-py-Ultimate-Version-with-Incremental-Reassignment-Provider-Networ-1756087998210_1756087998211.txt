@@ -1,0 +1,280 @@
+# network_optimizer_enhanced.py (Ultimate Version with Incremental Reassignment)
+"""
+Provider Network Optimizer - Ultimate Performance Version
+
+This script:
+ - Uses an intelligent "incremental reassignment" algorithm in the main loop.
+ - Numba JIT-compiles core logic.
+ - Limits the removal search space.
+ - Uses a k-d tree for ultra-fast nearest-neighbor searches.
+"""
+
+import argparse
+import logging
+import json
+import os
+from typing import Any, Dict, Iterable, List, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy.spatial import cKDTree
+from numba import njit
+
+# (All configuration and utility functions remain the same as the previous version)
+# ... [unchanged code] ...
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("network_optimizer_enhanced")
+MAX_DRIVE_MIN = 30.0
+MIN_COVERAGE_PCT = 95.0
+MIN_AVG_RATING = 3.0 
+TARGET_REDUCTION = (0.08, 0.12)
+MINUTES_PER_KM = 1.2
+K_NEAREST_PROVIDERS = 50
+MAX_REMOVAL_CANDIDATES = 5000 
+TYPE_CANONICAL = {"hospital": ["hospital", "hosp", "acute care", "psychiatric", "rehabilitation", "children"],"nursing_home": ["nursing", "home health", "assisted living", "foster care", "hospice", "residential care", "skilled nursing"],"scan_center": ["scan", "imaging", "mri", "ct", "x-ray", "ultrasound"],"clinic": ["clinic", "outpatient", "primary care", "pediatrician", "optometrist", "obstetric"],"supplier_directory": ["supplier", "directory", "pharmacy", "medical supply", "optician", "orthotic", "prosthetic"],"other": ["grocery", "department store"]}
+TYPE_MIN_COUNTS = {"hospital": 1,"nursing_home": 0,"scan_center": 0,"clinic": 1,"supplier_directory": 0}
+
+def find_col(df: pd.DataFrame, candidates: Iterable[str]) -> str:
+    cols = list(df.columns); lowered = {c.lower().replace(" ", "").replace("_", ""): c for c in cols}
+    for cand in candidates:
+        key = cand.lower().replace(" ", "").replace("_", "");
+        if key in lowered: return lowered[key]
+    for cand in candidates:
+        if cand in cols: return cand
+    return None
+def map_columns_providers(df: pd.DataFrame) -> pd.DataFrame:
+    col_map = {"ProviderId": find_col(df, ["providerid", "provider id", "provider_id", "id"]),"Source": find_col(df, ["source"]),"Type": find_col(df, ["type", "facilitytype"]),"Latitude": find_col(df, ["latitude", "lat", "latt"]),"Longitude": find_col(df, ["longitude", "lon", "lng"]),"CMS_Rating": find_col(df, ["cmsrating", "cms rating", "rating", "star"]),"Availability": find_col(df, ["availability", "capacity", "avail"]),"Cost": find_col(df, ["cost", "annualcost", "contractcost"])}
+    rename_map = {v: k for k, v in col_map.items() if v}; return df.rename(columns=rename_map)
+def map_columns_members(df: pd.DataFrame) -> pd.DataFrame:
+    col_map = {"MemberId": find_col(df, ["memberid", "member id", "member_id", "id"]),"Latitude": find_col(df, ["latitude", "lat"]),"Longitude": find_col(df, ["longitude", "lon", "lng"])}
+    rename_map = {v: k for k, v in col_map.items() if v}; return df.rename(columns=rename_map)
+def normalize_provider_type(t: Any) -> str:
+    if pd.isna(t): return "other"
+    s = str(t).strip().lower()
+    for canon, examples in TYPE_CANONICAL.items():
+        for ex in examples:
+            if ex in s: return canon
+    return "other"
+def apply_type_normalization(providers: pd.DataFrame) -> pd.DataFrame:
+    prov = providers.copy(); raw = prov.get("Type", prov.get("Source", pd.Series(["other"] * len(prov))))
+    prov["ProviderType"] = raw.fillna("other").astype(str).apply(normalize_provider_type); return prov
+@njit
+def haversine_km_numba(lat1, lon1, lat2, lon2):
+    R = 6371.0; lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1); lat2_rad, lon2_rad = np.radians(lat2), np.radians(lon2)
+    dlon = lon2_rad - lon1_rad; dlat = lat2_rad - lat1_rad
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a)); return R * c
+def build_candidate_pairs(members: pd.DataFrame, providers: pd.DataFrame) -> pd.DataFrame:
+    if members.empty or providers.empty: return pd.DataFrame()
+    logger.info("Building provider k-d tree for fast spatial queries..."); provider_coords = providers[['Latitude', 'Longitude']].to_numpy(); provider_tree = cKDTree(provider_coords)
+    member_coords = members[['Latitude', 'Longitude']].to_numpy(); max_dist_in_degrees = MAX_DRIVE_MIN / MINUTES_PER_KM / 111.0 
+    logger.info(f"Querying for the {K_NEAREST_PROVIDERS} nearest providers for each member...")
+    distances, indices = provider_tree.query(member_coords, k=K_NEAREST_PROVIDERS, distance_upper_bound=max_dist_in_degrees, workers=-1)
+    logger.info("Filtering and building final candidate list...")
+    valid_pairs = []; member_ids = members['MemberId'].values; provider_ids = providers['ProviderId'].values
+    for i in range(len(member_coords)): 
+        for j in range(K_NEAREST_PROVIDERS): 
+            provider_idx = indices[i, j]
+            if provider_idx < len(providers): 
+                dist_km = haversine_km_numba(member_coords[i, 0], member_coords[i, 1], provider_coords[provider_idx, 0], provider_coords[provider_idx, 1])
+                drive_time = dist_km * MINUTES_PER_KM
+                if drive_time <= MAX_DRIVE_MIN: valid_pairs.append((member_ids[i], provider_ids[provider_idx], drive_time))
+    if not valid_pairs:
+        logger.warning("No member-provider pairs found within %.1f minutes.", MAX_DRIVE_MIN); return pd.DataFrame()
+    return pd.DataFrame(valid_pairs, columns=['MemberId', 'ProviderId', 'DriveTimeMin'])
+def interpret_capacity(providers: pd.DataFrame, members_count: int) -> pd.DataFrame:
+    prov = providers.copy(); n_prov = max(1, len(providers)); avg_panel_size = max(1, int(round(members_count / n_prov)))
+    def calc_cap(avail):
+        if avail <= 1.0: return max(1, int(round(avail * avg_panel_size)))
+        return max(1, int(round(avail)))
+    prov["Capacity"] = prov["Availability"].astype(float).fillna(0.0).apply(calc_cap); return prov
+def assign_greedy(members: pd.DataFrame, providers: pd.DataFrame, candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return pd.DataFrame(columns=["MemberId", "ProviderId"])
+
+    # CORRECTED: The merge is no longer needed here as 'candidates' now comes pre-enriched.
+    # We just need to sort the candidates DataFrame directly.
+    cand = candidates.sort_values(
+        ["MemberId", "DriveTimeMin", "CMS_Rating", "Cost"], ascending=[True, True, False, True]
+    )
+    
+    # The rest of the function remains the same
+    capacity_map = providers.set_index("ProviderId")["Capacity"].to_dict()
+    assignments = []
+    assigned_members = set()
+
+    for row in cand.itertuples(index=False):
+        if hasattr(row, 'MemberId') and row.MemberId not in assigned_members and capacity_map.get(row.ProviderId, 0) > 0:
+            assignments.append((row.MemberId, row.ProviderId))
+            capacity_map[row.ProviderId] -= 1
+            assigned_members.add(row.MemberId)
+            
+    return pd.DataFrame(assignments, columns=["MemberId", "ProviderId"])
+def evaluate(assignments: pd.DataFrame, members: pd.DataFrame, providers: pd.DataFrame) -> Dict[str, Any]:
+    total_members = len(members)
+    if assignments.empty: return {"coverage_pct": 0.0, "avg_rating": 0.0, "total_cost": 0.0, "providers_used": 0, "final_assignments": pd.DataFrame()}
+    covered_members = assignments["MemberId"].nunique(); coverage_pct = (covered_members / total_members * 100.0) if total_members else 0.0
+    used_provider_counts = assignments["ProviderId"].value_counts(); used_providers = providers[providers["ProviderId"].isin(used_provider_counts.index)].copy()
+    avg_rating = used_providers["CMS_Rating"].mean() if not used_providers.empty else 0.0; total_cost = used_providers["Cost"].sum() if not used_providers.empty else 0.0
+    final_assignments = assignments.merge(providers[["ProviderId", "ProviderType", "CMS_Rating", "Cost"]], on="ProviderId")
+    return {"coverage_pct": float(coverage_pct),"avg_rating": float(avg_rating),"total_cost": float(total_cost),"providers_used": len(used_providers),"final_assignments": final_assignments}
+def compute_removal_priority(assignments: pd.DataFrame, candidates: pd.DataFrame, providers: pd.DataFrame) -> pd.DataFrame:
+    provider_assignments = assignments.groupby("ProviderId")["MemberId"].apply(list).to_dict(); member_alternatives = candidates.groupby("MemberId")["ProviderId"].nunique().to_dict()
+    rows = []
+    for p in providers.itertuples():
+        assigned_mids = provider_assignments.get(p.ProviderId, [])
+        num_assigned, num_unique = len(assigned_mids), sum(1 for mid in assigned_mids if member_alternatives.get(mid, 1) <= 1)
+        cost_per_assigned = p.Cost / max(1, num_assigned); score = cost_per_assigned - (p.CMS_Rating * 1000) + (num_unique * 10000)
+        rows.append((p.ProviderId, score))
+    return pd.DataFrame(rows, columns=["ProviderId", "Score"]).sort_values("Score", ascending=False)
+
+# ULTIMATE BOOST: New, much faster safe_prune function
+def safe_prune(members: pd.DataFrame, providers: pd.DataFrame) -> Dict[str, Any]:
+    providers_with_capacity = interpret_capacity(providers, len(members))
+    providers_with_types = apply_type_normalization(providers_with_capacity)
+    
+    # Pre-calculate all possible member-provider options once
+    candidates = build_candidate_pairs(members, providers_with_types)
+    if candidates.empty: raise RuntimeError(f"No viable member-provider pairs found within {MAX_DRIVE_MIN} minutes.")
+    
+    # Merge provider data into candidates for fast lookups
+    candidates_with_attrs = candidates.merge(
+        providers_with_types[["ProviderId", "CMS_Rating", "Cost", "Capacity", "ProviderType"]], on="ProviderId"
+    )
+
+    # Establish baseline
+    base_assign = assign_greedy(members, providers_with_types, candidates_with_attrs)
+    base_kpi = evaluate(base_assign, members, providers_with_types)
+    baseline_cost = base_kpi["total_cost"]
+    
+    logger.info(f"Baseline: coverage={base_kpi['coverage_pct']:.2f}% | avg_rating={base_kpi['avg_rating']:.2f} | cost=${baseline_cost:,.2f} | providers={base_kpi['providers_used']}")
+    if base_kpi["coverage_pct"] < MIN_COVERAGE_PCT: raise RuntimeError(f"Baseline coverage is {base_kpi['coverage_pct']:.2f}%, below required {MIN_COVERAGE_PCT}%.")
+    
+    removal_candidates = compute_removal_priority(base_assign, candidates, providers_with_types).head(MAX_REMOVAL_CANDIDATES)
+    logger.info(f"Considering the top {MAX_REMOVAL_CANDIDATES} providers for removal...")
+
+    current_assignments = base_assign.copy()
+    current_providers_set = set(providers_with_types['ProviderId'])
+    removed_pids = []
+    
+    capacity_map = providers_with_types.set_index("ProviderId")["Capacity"].to_dict()
+    provider_info = providers_with_types.set_index('ProviderId')
+
+    # Main optimization loop
+    for i, row in enumerate(removal_candidates.itertuples(index=False)):
+        if i % 50 == 0 and i > 0: logger.info(f"Processing removal candidate {i}/{len(removal_candidates)}...")
+        
+        pid_to_remove = row.ProviderId
+        
+        # Fast check for type constraint violation
+        provider_type = provider_info.loc[pid_to_remove, 'ProviderType']
+        type_count = provider_info.loc[list(current_providers_set)].ProviderType.value_counts().get(provider_type, 0)
+        if type_count - 1 < TYPE_MIN_COUNTS.get(provider_type, 0):
+            continue
+
+        # Identify members who need reassignment (this is the key speedup)
+        members_to_reassign = current_assignments[current_assignments['ProviderId'] == pid_to_remove]
+        if members_to_reassign.empty:
+            # If provider had no assignments, we can safely remove them if cost is positive
+            if provider_info.loc[pid_to_remove, 'Cost'] > 0:
+                current_providers_set.remove(pid_to_remove)
+                removed_pids.append(pid_to_remove)
+                # No need to log here as it's a minor change
+            continue
+            
+        # Temporarily remove the provider and update assignments
+        trial_providers_set = current_providers_set - {pid_to_remove}
+        other_assignments = current_assignments[current_assignments['ProviderId'] != pid_to_remove]
+        
+        # Find new assignments ONLY for the displaced members
+        reassign_candidates = candidates_with_attrs[
+            candidates_with_attrs['MemberId'].isin(members_to_reassign['MemberId']) &
+            candidates_with_attrs['ProviderId'].isin(trial_providers_set)
+        ]
+        
+        # Fast, small-scale greedy assignment
+        new_assignments = assign_greedy(members_to_reassign, provider_info.loc[list(trial_providers_set)].reset_index(), reassign_candidates)
+        
+        # Combine to form the new trial assignment table
+        trial_assignments = pd.concat([other_assignments, new_assignments], ignore_index=True)
+        
+        # Evaluate the new network state
+        trial_providers_df = provider_info.loc[list(trial_providers_set)].reset_index()
+        trial_kpi = evaluate(trial_assignments, members, trial_providers_df)
+        
+        # Check constraints
+        if trial_kpi["coverage_pct"] < MIN_COVERAGE_PCT or trial_kpi["avg_rating"] < MIN_AVG_RATING:
+            continue
+        
+        # Check target reduction
+        current_cost = trial_kpi["total_cost"]
+        reduction = (baseline_cost - current_cost) / baseline_cost if baseline_cost > 0 else 0
+        
+        if reduction < TARGET_REDUCTION[0]:
+            current_providers_set = trial_providers_set
+            current_assignments = trial_assignments
+            removed_pids.append(pid_to_remove)
+            logger.info(f"Removed {pid_to_remove}. New reduction: {reduction:.2%}")
+        elif TARGET_REDUCTION[0] <= reduction <= TARGET_REDUCTION[1]:
+            current_providers_set = trial_providers_set
+            removed_pids.append(pid_to_remove)
+            logger.info(f"SUCCESS: Removed {pid_to_remove}. Final reduction {reduction:.2%} is within target.")
+            break
+    
+    final_providers_df = provider_info.loc[list(current_providers_set)].reset_index()
+    final_assign = assign_greedy(members, final_providers_df, candidates_with_attrs[candidates_with_attrs['ProviderId'].isin(current_providers_set)])
+    final_kpi = evaluate(final_assign, members, final_providers_df)
+    
+    return {"baseline": base_kpi, "final": final_kpi, "final_providers": final_providers_df, "removed_providers": provider_info.loc[removed_pids].reset_index()}
+
+
+def load_and_validate_data(providers_csv: str, members_csv: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    prov, mem = pd.read_csv(providers_csv), pd.read_csv(members_csv)
+    if prov.empty or mem.empty: raise ValueError("Provider or member input file is empty.")
+    prov, mem = map_columns_providers(prov), map_columns_members(mem)
+    req_prov_cols, req_mem_cols = ["ProviderId", "Latitude", "Longitude", "CMS_Rating", "Availability", "Cost"], ["MemberId", "Latitude", "Longitude"]
+    if any(c not in prov.columns for c in req_prov_cols) or any(c not in mem.columns for c in req_mem_cols): raise ValueError("One or more required columns are missing after mapping.")
+    prov, mem = prov.drop_duplicates(subset=["ProviderId"]), mem.drop_duplicates(subset=["MemberId"])
+    for col in ["Latitude", "Longitude", "CMS_Rating", "Availability", "Cost"]: prov[col] = pd.to_numeric(prov[col], errors='coerce')
+    for col in ["Latitude", "Longitude"]: mem[col] = pd.to_numeric(mem[col], errors='coerce')
+    prov, mem = prov.dropna(subset=req_prov_cols), mem.dropna(subset=req_mem_cols)
+    if not prov["Latitude"].between(-90, 90).all() or not prov["Longitude"].between(-180, 180).all(): raise ValueError("Invalid geographic coordinates in provider data.")
+    if not mem["Latitude"].between(-90, 90).all() or not mem["Longitude"].between(-180, 180).all(): raise ValueError("Invalid geographic coordinates in member data.")
+    if (prov["Cost"] < 0).any() or (prov["CMS_Rating"] < 0).any(): raise ValueError("Negative Cost or CMS_Rating in provider data.")
+    return prov.reset_index(drop=True), mem.reset_index(drop=True)
+
+def main():
+    parser = argparse.ArgumentParser(description="Provider Network Optimizer (Ultimate Performance)")
+    parser.add_argument("--providers", required=True, help="Providers CSV path")
+    parser.add_argument("--members", required=True, help="Members CSV path")
+    parser.add_argument("--output-dir", help="Directory to save output CSV files (optional)")
+    args = parser.parse_args()
+    try:
+        providers, members = load_and_validate_data(args.providers, args.members)
+        logger.info(f"Loaded and validated {len(providers)} providers and {len(members)} members.")
+        result = safe_prune(members, providers)
+        base_kpi, final_kpi = result["baseline"], result["final"]
+        final_reduction = (base_kpi["total_cost"] - final_kpi["total_cost"]) / base_kpi["total_cost"] if base_kpi["total_cost"] > 0 else 0
+        logger.info("="*20 + " RESULTS " + "="*20)
+        logger.info(f"Final Coverage: {final_kpi['coverage_pct']:.2f}%")
+        logger.info(f"Final Avg Rating: {final_kpi['avg_rating']:.2f}")
+        logger.info(f"Final Cost: ${final_kpi['total_cost']:,.2f}")
+        logger.info(f"Cost Reduction: {final_reduction:.2%}")
+        logger.info(f"Providers in Final Network: {final_kpi['providers_used']}")
+        logger.info(f"Providers Removed: {len(result['removed_providers'])}")
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            out_final_prov, out_assignments, out_summary = os.path.join(args.output_dir, "final_providers.csv"), os.path.join(args.output_dir, "member_assignments.csv"), os.path.join(args.output_dir, "run_summary.json")
+            result["final_providers"].to_csv(out_final_prov, index=False)
+            final_kpi["final_assignments"].to_csv(out_assignments, index=False)
+            summary = {"reduction_pct": final_reduction * 100,"final_coverage_pct": final_kpi['coverage_pct'],"final_avg_rating": final_kpi['avg_rating'],"baseline_cost": base_kpi['total_cost'],"final_cost": final_kpi['total_cost'],"providers_started": len(providers),"providers_final": final_kpi['providers_used'],"providers_removed": len(result['removed_providers'])}
+            with open(out_summary, 'w') as f: json.dump(summary, f, indent=4)
+            logger.info(f"Saved results to directory: {args.output_dir}")
+    except (ValueError, RuntimeError) as e:
+        logger.error(f"A critical error occurred: {e}")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred: {e}")
+        raise
+
+if _name_ == "_main_":
+    main()
