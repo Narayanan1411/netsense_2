@@ -22,6 +22,21 @@ st.set_page_config(
 
 def main():
     st.title("🏥 Provider Network Optimizer Dashboard")
+    
+    # Page navigation
+    page = st.selectbox(
+        "Choose a feature:",
+        ["🔧 Network Optimization", "📍 Find Nearest Providers"],
+        index=0
+    )
+    
+    if page == "🔧 Network Optimization":
+        network_optimization_page()
+    else:
+        provider_finder_page()
+
+def network_optimization_page():
+    """Main network optimization interface"""
     st.markdown("Upload provider and member CSV files to optimize your healthcare network")
     
     # Initialize session state
@@ -106,6 +121,239 @@ def main():
     
     # Display file previews
     display_file_previews(provider_file, member_file)
+
+def provider_finder_page():
+    """Provider finder interface for user location lookup"""
+    st.markdown("Enter your location coordinates to find the nearest healthcare providers")
+    
+    # Check if we have provider data from optimization
+    if st.session_state.processed_data is None:
+        st.warning("⚠️ No provider data available. Please run network optimization first to load provider data.")
+        st.info("💡 Go to 'Network Optimization' page and upload provider data to use this feature.")
+        return
+    
+    providers_df = st.session_state.processed_data['providers']
+    
+    # Check for required columns
+    required_cols = ['Latitude', 'Longitude', 'ProviderId', 'Cost', 'CMS_Rating']
+    missing_cols = [col for col in required_cols if col not in providers_df.columns]
+    
+    if missing_cols:
+        st.error(f"❌ Missing required columns in provider data: {', '.join(missing_cols)}")
+        return
+    
+    # User input section
+    st.header("📍 Your Location")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        user_lat = st.number_input(
+            "Latitude",
+            min_value=-90.0,
+            max_value=90.0,
+            value=40.7128,  # Default to NYC
+            format="%.6f",
+            help="Enter your latitude coordinate"
+        )
+    
+    with col2:
+        user_lon = st.number_input(
+            "Longitude", 
+            min_value=-180.0,
+            max_value=180.0,
+            value=-74.0060,  # Default to NYC
+            format="%.6f",
+            help="Enter your longitude coordinate"
+        )
+    
+    # Configuration
+    st.header("⚙️ Search Options")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        num_providers = st.slider(
+            "Number of Providers",
+            min_value=5,
+            max_value=50,
+            value=10,
+            help="How many nearest providers to show"
+        )
+    
+    with col2:
+        max_distance = st.slider(
+            "Max Distance (miles)",
+            min_value=5,
+            max_value=100,
+            value=25,
+            help="Maximum distance to search for providers"
+        )
+    
+    with col3:
+        min_rating = st.slider(
+            "Minimum Rating",
+            min_value=1.0,
+            max_value=5.0,
+            value=2.0,
+            step=0.1,
+            help="Minimum CMS rating filter"
+        )
+    
+    # Search button
+    if st.button("🔍 Find Nearest Providers", type="primary", use_container_width=True):
+        with st.spinner("🔍 Searching for nearest providers..."):
+            nearest_providers = find_nearest_providers(
+                user_lat, user_lon, providers_df, num_providers, max_distance, min_rating
+            )
+            
+            if nearest_providers.empty:
+                st.warning(f"❌ No providers found within {max_distance} miles with rating ≥ {min_rating}")
+            else:
+                display_nearest_providers(nearest_providers, user_lat, user_lon)
+
+def find_nearest_providers(user_lat, user_lon, providers_df, num_providers, max_distance, min_rating):
+    """Find nearest providers using spatial search"""
+    from scipy.spatial import cKDTree
+    import numpy as np
+    
+    # Filter providers by rating
+    filtered_providers = providers_df[providers_df['CMS_Rating'] >= min_rating].copy()
+    
+    if filtered_providers.empty:
+        return pd.DataFrame()
+    
+    # Build spatial index
+    provider_coords = filtered_providers[['Latitude', 'Longitude']].values
+    tree = cKDTree(provider_coords)
+    
+    # Find nearest providers
+    distances, indices = tree.query(
+        [user_lat, user_lon], 
+        k=min(num_providers, len(filtered_providers)),
+        distance_upper_bound=max_distance / 69.0  # Rough conversion to degrees
+    )
+    
+    # Filter out invalid distances (beyond max_distance)
+    valid_mask = distances != np.inf
+    if not np.any(valid_mask):
+        return pd.DataFrame()
+    
+    valid_distances = distances[valid_mask]
+    valid_indices = indices[valid_mask]
+    
+    # Get the nearest providers
+    nearest_providers = filtered_providers.iloc[valid_indices].copy()
+    
+    # Calculate accurate distances in miles
+    nearest_providers['Distance_Miles'] = [
+        calculate_distance(user_lat, user_lon, row['Latitude'], row['Longitude'])
+        for _, row in nearest_providers.iterrows()
+    ]
+    
+    # Filter by actual distance and sort
+    nearest_providers = nearest_providers[nearest_providers['Distance_Miles'] <= max_distance]
+    nearest_providers = nearest_providers.sort_values('Distance_Miles')
+    
+    return nearest_providers
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance between two points using Haversine formula"""
+    import math
+    
+    # Convert to radians
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    
+    # Haversine formula
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    
+    # Earth radius in miles
+    r = 3956
+    
+    return c * r
+
+def display_nearest_providers(providers_df, user_lat, user_lon):
+    """Display the nearest providers with details"""
+    st.header("🏥 Nearest Providers")
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric("Providers Found", len(providers_df))
+    
+    with col2:
+        avg_distance = providers_df['Distance_Miles'].mean()
+        st.metric("Avg Distance", f"{avg_distance:.1f} mi")
+    
+    with col3:
+        avg_rating = providers_df['CMS_Rating'].mean()
+        st.metric("Avg Rating", f"{avg_rating:.2f}")
+    
+    with col4:
+        closest_distance = providers_df['Distance_Miles'].min()
+        st.metric("Closest Provider", f"{closest_distance:.1f} mi")
+    
+    # Providers table
+    st.subheader("📋 Provider Details")
+    
+    # Format the display data
+    display_data = providers_df.copy()
+    display_data['Distance_Miles'] = display_data['Distance_Miles'].apply(lambda x: f"{x:.1f}")
+    display_data['Cost'] = display_data['Cost'].apply(lambda x: f"${x:,.0f}")
+    display_data['CMS_Rating'] = display_data['CMS_Rating'].apply(lambda x: f"{x:.1f}")
+    
+    # Select columns for display
+    display_columns = ['ProviderId', 'Distance_Miles', 'CMS_Rating', 'Cost']
+    if 'ProviderType' in display_data.columns:
+        display_columns.insert(1, 'ProviderType')
+    
+    st.dataframe(
+        display_data[display_columns],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            'ProviderId': 'Provider ID',
+            'ProviderType': 'Type',
+            'Distance_Miles': 'Distance (mi)',
+            'CMS_Rating': 'Rating',
+            'Cost': 'Annual Cost'
+        }
+    )
+    
+    # Distance distribution chart
+    if len(providers_df) > 1:
+        st.subheader("📊 Distance Distribution")
+        fig_dist = px.histogram(
+            providers_df,
+            x='Distance_Miles',
+            nbins=10,
+            title="Provider Distance Distribution",
+            labels={'Distance_Miles': 'Distance (miles)', 'count': 'Number of Providers'}
+        )
+        st.plotly_chart(fig_dist, use_container_width=True)
+    
+    # Rating vs Distance scatter plot
+    if len(providers_df) > 1:
+        st.subheader("🎯 Rating vs Distance Analysis")
+        fig_scatter = px.scatter(
+            providers_df,
+            x='Distance_Miles',
+            y='CMS_Rating',
+            color='ProviderType' if 'ProviderType' in providers_df.columns else None,
+            size='Cost',
+            title="Provider Rating vs Distance",
+            labels={
+                'Distance_Miles': 'Distance (miles)',
+                'CMS_Rating': 'CMS Rating',
+                'Cost': 'Annual Cost'
+            },
+            hover_data={'ProviderId': True, 'Cost': ':,.0f'}
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
 def run_optimization(provider_file, member_file, max_drive_time, min_coverage, min_rating):
     """Run the network optimization process"""
