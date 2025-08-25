@@ -47,3 +47,6 @@ args = "uv add scipy numba plotly"
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[agent]
+integrations = ["flask_supabase==1.0.0"]

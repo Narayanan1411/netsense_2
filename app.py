@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -9,8 +10,21 @@ import json
 from typing import Dict, Any
 import traceback
 
+# Supabase integration
+from supabase import create_client, Client
+
 from network_optimizer import NetworkOptimizer
+
 from utils import validate_csv_structure, get_sample_data_info
+
+# --- Supabase Config ---
+SUPABASE_URL = st.secrets["SUPABASE_URL"] if "SUPABASE_URL" in st.secrets else "https://your-project.supabase.co"
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"] if "SUPABASE_KEY" in st.secrets else "your-anon-key"
+
+def get_supabase_client():
+    if "supabase" not in st.session_state:
+        st.session_state["supabase"] = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return st.session_state["supabase"]
 
 # Configure page
 st.set_page_config(
@@ -20,20 +34,86 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+
 def main():
     st.title("🏥 Provider Network Optimizer Dashboard")
-    
-    # Page navigation
-    page = st.selectbox(
-        "Choose a feature:",
-        ["🔧 Network Optimization", "📍 Find Nearest Providers"],
-        index=0
-    )
-    
-    if page == "🔧 Network Optimization":
-        network_optimization_page()
+
+    # --- Authentication ---
+    if "user" not in st.session_state:
+        show_auth_page()
+        return
+
+    user = st.session_state["user"]
+    role = user.get("role", "user")
+
+    st.sidebar.write(f"👤 Logged in as: {user['email']} ({role})")
+    if st.sidebar.button("Logout"):
+        st.session_state.pop("user")
+        st.rerun()
+
+    # Page navigation based on role
+    if role == "admin":
+        page = st.selectbox(
+            "Choose a feature:",
+            ["🔧 Network Optimization", "📍 Find Nearest Providers"],
+            index=0
+        )
+        if page == "🔧 Network Optimization":
+            network_optimization_page()
+        else:
+            provider_finder_page()
     else:
         provider_finder_page()
+
+
+# --- Authentication Page ---
+def show_auth_page():
+    st.header("🔐 Login to DataDash")
+    tab1, tab2 = st.tabs(["Login", "Register"])
+
+    with tab1:
+        login_email = st.text_input("Email", key="login_email")
+        login_password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", key="login_btn", use_container_width=True):
+            supabase = get_supabase_client()
+            try:
+                res = supabase.auth.sign_in_with_password({"email": login_email, "password": login_password})
+                user = res.user
+                if user:
+                    # Fetch user role from profile table
+                    profile = (
+                        supabase.table("profiles")
+                        .select("role")
+                        .eq("id", user.id)
+                        .single()
+                        .execute()
+                    )
+                    role = profile.data["role"] if profile.data and "role" in profile.data else "user"
+                    st.session_state["user"] = {"email": login_email, "id": user.id, "role": role}
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid credentials.")
+            except Exception as e:
+                st.error(f"Login failed: {e}")
+
+    with tab2:
+        reg_email = st.text_input("Email", key="reg_email")
+        reg_password = st.text_input("Password", type="password", key="reg_password")
+        reg_role = st.selectbox("Role", ["user", "admin"], key="reg_role")
+        if st.button("Register", key="register_btn", use_container_width=True):
+            supabase = get_supabase_client()
+            try:
+                res = supabase.auth.sign_up({"email": reg_email, "password": reg_password})
+                user = res.user
+                if user:
+                    # Insert into profiles table
+                    supabase.table("profiles").insert({"id": user.id, "email": reg_email, "role": reg_role}).execute()
+                    st.success("Registration successful! Please login.")
+                else:
+                    st.error("Registration failed.")
+            except Exception as e:
+                st.error(f"Registration failed: {e}")
 
 def network_optimization_page():
     """Main network optimization interface"""
@@ -125,28 +205,60 @@ def network_optimization_page():
 def provider_finder_page():
     """Provider finder interface for user location lookup"""
     st.markdown("Enter your location coordinates to find the nearest healthcare providers")
-    
-    # Check if we have provider data from optimization
-    if st.session_state.processed_data is None:
-        st.warning("⚠️ No provider data available. Please run network optimization first to load provider data.")
+
+    # Always try to fetch the latest optimized network from Supabase
+    supabase = get_supabase_client()
+    user = st.session_state.get("user", {})
+    providers_df = None
+
+    # Try to get the latest optimized network (admin: their own, user: any latest)
+    try:
+        role = user.get("role", "user")
+        if role == "admin":
+            # Admin: get their own latest
+            query = supabase.table("optimized_networks").select("optimized_providers").eq("user_id", user.get("id", "")).order("created_at", desc=True).limit(1)
+        else:
+            # User: get latest from any admin
+            # (Assumes admin's user_id is used for optimization)
+            admin_profiles = supabase.table("profiles").select("id").eq("role", "admin").execute()
+            admin_ids = [row["id"] for row in admin_profiles.data] if admin_profiles.data else []
+            if admin_ids:
+                query = supabase.table("optimized_networks").select("optimized_providers").in_("user_id", admin_ids).order("created_at", desc=True).limit(1)
+            else:
+                query = None
+        if query:
+            res = query.execute()
+            if res.data and len(res.data) > 0:
+                providers_json = res.data[0]["optimized_providers"]
+                providers_df = pd.DataFrame(json.loads(providers_json))
+    except Exception as e:
+        st.warning(f"Could not fetch optimized network from backend: {e}")
+
+    # Fallback to session state if not found
+    if providers_df is None and st.session_state.get("processed_data") is not None:
+        providers_df = st.session_state.processed_data['providers']
+
+    if providers_df is None:
+        st.warning("⚠️ No provider data available. Please run network optimization as admin to load provider data.")
         st.info("💡 Go to 'Network Optimization' page and upload provider data to use this feature.")
         return
-    
-    providers_df = st.session_state.processed_data['providers']
-    
-    # Check for required columns
+
+    # Support both 'CMS_Rating' and 'CMS Rating' column names
+    if 'CMS Rating' in providers_df.columns and 'CMS_Rating' not in providers_df.columns:
+        providers_df = providers_df.rename(columns={'CMS Rating': 'CMS_Rating'})
+
     required_cols = ['Latitude', 'Longitude', 'ProviderId', 'Cost', 'CMS_Rating']
     missing_cols = [col for col in required_cols if col not in providers_df.columns]
-    
+
     if missing_cols:
         st.error(f"❌ Missing required columns in provider data: {', '.join(missing_cols)}")
         return
-    
+
     # User input section
     st.header("📍 Your Location")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         user_lat = st.number_input(
             "Latitude",
@@ -156,7 +268,7 @@ def provider_finder_page():
             format="%.6f",
             help="Enter your latitude coordinate"
         )
-    
+
     with col2:
         user_lon = st.number_input(
             "Longitude", 
@@ -166,12 +278,12 @@ def provider_finder_page():
             format="%.6f",
             help="Enter your longitude coordinate"
         )
-    
+
     # Configuration
     st.header("⚙️ Search Options")
-    
+
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
         num_providers = st.slider(
             "Number of Providers",
@@ -180,7 +292,7 @@ def provider_finder_page():
             value=10,
             help="How many nearest providers to show"
         )
-    
+
     with col2:
         max_distance = st.slider(
             "Max Distance (miles)",
@@ -189,7 +301,7 @@ def provider_finder_page():
             value=25,
             help="Maximum distance to search for providers"
         )
-    
+
     with col3:
         min_rating = st.slider(
             "Minimum Rating",
@@ -199,14 +311,13 @@ def provider_finder_page():
             step=0.1,
             help="Minimum CMS rating filter"
         )
-    
+
     # Search button
     if st.button("🔍 Find Nearest Providers", type="primary", use_container_width=True):
         with st.spinner("🔍 Searching for nearest providers..."):
             nearest_providers = find_nearest_providers(
                 user_lat, user_lon, providers_df, num_providers, max_distance, min_rating
             )
-            
             if nearest_providers.empty:
                 st.warning(f"❌ No providers found within {max_distance} miles with rating ≥ {min_rating}")
             else:
@@ -355,60 +466,61 @@ def display_nearest_providers(providers_df, user_lat, user_lon):
         )
         st.plotly_chart(fig_scatter, use_container_width=True)
 
+
 def run_optimization(provider_file, member_file, max_drive_time, min_coverage, min_rating):
-    """Run the network optimization process"""
+    """Run the network optimization process and store results in Supabase"""
     with st.spinner("🔄 Processing data and running optimization..."):
         try:
             # Read and validate CSV files
             providers_df = pd.read_csv(provider_file)
             members_df = pd.read_csv(member_file)
-            
+
             # Validate CSV structure
             provider_validation = validate_csv_structure(providers_df, 'provider')
             member_validation = validate_csv_structure(members_df, 'member')
-            
+
             if not provider_validation['valid']:
                 st.error(f"❌ Provider CSV validation failed: {provider_validation['message']}")
                 return
-            
+
             if not member_validation['valid']:
                 st.error(f"❌ Member CSV validation failed: {member_validation['message']}")
                 return
-            
+
             # Initialize optimizer with configuration
             optimizer = NetworkOptimizer(
                 max_drive_min=max_drive_time,
                 min_coverage_pct=min_coverage,
                 min_avg_rating=min_rating
             )
-            
+
             # Run optimization with progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
             progress_container = st.container()
-            
+
             status_text.text("🔍 Analyzing provider data...")
             progress_bar.progress(20)
-            
+
             status_text.text("👥 Processing member data...")
             progress_bar.progress(40)
-            
+
             status_text.text("🧮 Building candidate pairs...")
             progress_bar.progress(60)
-            
+
             status_text.text("⚡ Running optimization algorithm...")
             progress_bar.progress(80)
-            
+
             # Add a live log container for real-time updates
             log_container = progress_container.empty()
-            
+
             class StreamlitProgressHandler:
                 def __init__(self, log_container, status_text):
                     self.log_container = log_container
                     self.status_text = status_text
                     self.removed_count = 0
                     self.logs = []
-                
+
                 def update_progress(self, message):
                     if "Removed provider" in message:
                         self.removed_count += 1
@@ -418,16 +530,16 @@ def run_optimization(provider_file, member_file, max_drive_time, min_coverage, m
                         if len(self.logs) > 10:
                             self.logs.pop(0)
                         self.log_container.text("\n".join(self.logs[-5:]))  # Show last 5 entries
-            
+
             # Create progress handler and pass to optimizer
             progress_handler = StreamlitProgressHandler(log_container, status_text)
             optimizer.progress_handler = progress_handler
-            
+
             results = optimizer.optimize(members_df, providers_df)
-            
+
             status_text.text("✅ Optimization complete!")
             progress_bar.progress(100)
-            
+
             # Store results in session state
             st.session_state.optimization_results = results
             st.session_state.processed_data = {
@@ -439,14 +551,33 @@ def run_optimization(provider_file, member_file, max_drive_time, min_coverage, m
                     'min_rating': min_rating
                 }
             }
-            
+
+            # --- Store optimized provider data in Supabase ---
+            user = st.session_state.get("user", {})
+            supabase = get_supabase_client()
+            try:
+                # Save only the optimized providers (as JSON)
+                optimized_providers = results['final_assignments'][['ProviderId', 'ProviderType', 'CMS_Rating', 'Cost']].drop_duplicates().to_dict('records')
+                supabase.table("optimized_networks").insert({
+                    "user_id": user.get("id", ""),
+                    "email": user.get("email", ""),
+                    "config": json.dumps({
+                        "max_drive_time": max_drive_time,
+                        "min_coverage": min_coverage,
+                        "min_rating": min_rating
+                    }),
+                    "optimized_providers": json.dumps(optimized_providers)
+                }).execute()
+            except Exception as db_exc:
+                st.warning(f"Could not save to backend: {db_exc}")
+
             # Clear progress indicators
             progress_bar.empty()
             status_text.empty()
-            
+
             st.success("🎉 Network optimization completed successfully!")
             st.rerun()
-            
+
         except Exception as e:
             st.error(f"❌ Error during optimization: {str(e)}")
             st.expander("🔍 Error Details", expanded=False).code(traceback.format_exc())
@@ -562,31 +693,38 @@ def display_analytics(results, data):
 def display_before_after_comparison(results, data):
     """Display comprehensive before vs after optimization comparison"""
     st.subheader("🔄 Before vs After Optimization")
-    
+
     # Calculate original network metrics
     providers_df = data['providers']
     members_df = data['members']
-    
+
+    # Support both 'CMS_Rating' and 'CMS Rating' column names
+    if 'CMS Rating' in providers_df.columns and 'CMS_Rating' not in providers_df.columns:
+        providers_df = providers_df.rename(columns={'CMS Rating': 'CMS_Rating'})
+    if 'CMS_Rating' not in providers_df.columns:
+        st.error("❌ Provider data missing 'CMS_Rating' column. Please check your CSV file.")
+        return
+
     # Original network metrics (all providers)
     original_cost = providers_df['Cost'].sum()
     original_providers = len(providers_df)
     original_avg_rating = providers_df['CMS_Rating'].mean()
-    
+
     # Optimized network metrics
     optimized_cost = results['total_cost']
     optimized_providers = results['providers_used']
     optimized_avg_rating = results['avg_rating']
     optimized_coverage = results['coverage_pct']
-    
+
     # Calculate savings
     cost_savings = original_cost - optimized_cost
     savings_percentage = (cost_savings / original_cost) * 100
     providers_removed = original_providers - optimized_providers
     reduction_percentage = (providers_removed / original_providers) * 100
-    
+
     # Main comparison metrics
     col1, col2, col3, col4 = st.columns(4)
-    
+
     with col1:
         st.metric(
             "Network Cost",
@@ -594,7 +732,7 @@ def display_before_after_comparison(results, data):
             delta=f"-${cost_savings:,.0f} ({savings_percentage:.1f}%)",
             delta_color="inverse"
         )
-    
+
     with col2:
         st.metric(
             "Providers Used",
@@ -602,7 +740,7 @@ def display_before_after_comparison(results, data):
             delta=f"-{providers_removed} ({reduction_percentage:.1f}%)",
             delta_color="inverse"
         )
-    
+
     with col3:
         rating_change = optimized_avg_rating - original_avg_rating
         st.metric(
@@ -611,19 +749,19 @@ def display_before_after_comparison(results, data):
             delta=f"{rating_change:+.2f}",
             delta_color="normal"
         )
-    
+
     with col4:
         st.metric(
             "Member Coverage",
             f"{optimized_coverage:.1f}%",
             help="Percentage of members assigned to providers"
         )
-    
+
     # Detailed comparison charts
     st.subheader("📊 Detailed Comparison")
-    
+
     col1, col2 = st.columns(2)
-    
+
     with col1:
         # Cost comparison bar chart
         comparison_data = {
@@ -640,7 +778,7 @@ def display_before_after_comparison(results, data):
         )
         fig_cost.update_layout(showlegend=False)
         st.plotly_chart(fig_cost, use_container_width=True)
-    
+
     with col2:
         # Provider count comparison
         comparison_providers = {
@@ -657,44 +795,44 @@ def display_before_after_comparison(results, data):
         )
         fig_providers.update_layout(showlegend=False)
         st.plotly_chart(fig_providers, use_container_width=True)
-    
+
     # Summary insights
     st.subheader("💡 Key Insights")
-    
+
     insights = []
     insights.append(f"**Cost Savings**: Achieved ${cost_savings:,.0f} savings ({savings_percentage:.1f}% reduction)")
     insights.append(f"**Network Efficiency**: Reduced provider count by {providers_removed} ({reduction_percentage:.1f}%)")
-    
+
     if rating_change > 0:
         insights.append(f"**Quality Improvement**: Average provider rating increased by {rating_change:.2f} points")
     elif rating_change < -0.1:
         insights.append(f"**Quality Trade-off**: Average provider rating decreased by {abs(rating_change):.2f} points")
     else:
         insights.append(f"**Quality Maintained**: Average provider rating remained stable")
-    
+
     insights.append(f"**Coverage**: {optimized_coverage:.1f}% of members successfully assigned to providers")
-    
+
     for insight in insights:
         st.write(f"• {insight}")
-    
+
     # Provider type analysis if available
     assignments = results['final_assignments']
     if not assignments.empty and 'ProviderType' in assignments.columns:
         st.subheader("🏥 Provider Type Analysis")
-        
+
         # Original provider types
         original_types = providers_df['ProviderType'].value_counts() if 'ProviderType' in providers_df.columns else None
-        
+
         # Optimized provider types
         optimized_types = assignments['ProviderType'].value_counts()
-        
+
         if original_types is not None:
             # Create comparison dataframe
             comparison_df = pd.DataFrame({
                 'Original': original_types,
                 'Optimized': optimized_types
             }).fillna(0)
-            
+
             # Provider type comparison chart
             fig_types = px.bar(
                 comparison_df.reset_index(),
@@ -874,10 +1012,30 @@ def export_results():
     
     # Export options
     col1, col2 = st.columns(2)
-    
+
+    # --- Metrics summary ---
+    summary_lines = [
+        f"Coverage (%):,{results['coverage_pct']:.1f}",
+        f"Average Rating:,{results['avg_rating']:.2f}",
+        f"Total Cost:,$ {results['total_cost']:,.0f}",
+        f"Providers Used:,{results['providers_used']}"
+    ]
+    # If available, add cost savings and other enhancements
+    data = st.session_state.get('processed_data')
+    if data:
+        providers_df = data.get('providers')
+        if providers_df is not None and 'Cost' in providers_df.columns:
+            original_cost = providers_df['Cost'].sum()
+            cost_savings = original_cost - results['total_cost']
+            savings_pct = (cost_savings / original_cost) * 100 if original_cost else 0
+            summary_lines.append(f"Original Cost:,$ {original_cost:,.0f}")
+            summary_lines.append(f"Cost Savings:,$ {cost_savings:,.0f} ({savings_pct:.1f}%)")
+
+    summary_csv = '\n'.join(summary_lines) + '\n\n'
+
     with col1:
-        # CSV export
-        csv_data = assignments.to_csv(index=False)
+        # CSV export with metrics summary at the top
+        csv_data = summary_csv + assignments.to_csv(index=False)
         st.download_button(
             label="📄 Download as CSV",
             data=csv_data,
@@ -885,7 +1043,7 @@ def export_results():
             mime="text/csv",
             use_container_width=True
         )
-    
+
     with col2:
         # JSON export with summary
         export_data = {
@@ -893,11 +1051,15 @@ def export_results():
                 'coverage_pct': results['coverage_pct'],
                 'avg_rating': results['avg_rating'],
                 'total_cost': results['total_cost'],
-                'providers_used': results['providers_used']
+                'providers_used': results['providers_used'],
             },
             'assignments': assignments.to_dict('records')
         }
-        
+        if data and providers_df is not None and 'Cost' in providers_df.columns:
+            export_data['optimization_summary']['original_cost'] = original_cost
+            export_data['optimization_summary']['cost_savings'] = cost_savings
+            export_data['optimization_summary']['savings_pct'] = savings_pct
+
         json_data = json.dumps(export_data, indent=2, default=str)
         st.download_button(
             label="📊 Download as JSON",
@@ -906,8 +1068,10 @@ def export_results():
             mime="application/json",
             use_container_width=True
         )
-    
+
     st.success("✅ Export options ready!")
 
 if __name__ == "__main__":
     main()
+
+# Note: The deploy button is not present in this code. If you see a deploy button, it may be injected by Streamlit Cloud or your environment. It cannot be removed from the codebase.
