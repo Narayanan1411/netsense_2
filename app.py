@@ -344,9 +344,9 @@ def display_geographic_view(results, data):
     elif 'CMS Rating' in assigned_providers.columns:
         hover_columns.append('CMS Rating')
     
-    # Create the map
+    # Create the map using the newer scatter_map function
     if color_column:
-        fig_map = px.scatter_mapbox(
+        fig_map = px.scatter_map(
             assigned_providers,
             lat='Latitude',
             lon='Longitude',
@@ -354,26 +354,25 @@ def display_geographic_view(results, data):
             size='Cost',
             hover_data=hover_columns,
             title="Geographic Distribution of Selected Providers",
-            mapbox_style="open-street-map",
             height=600
         )
     else:
         # Fallback without color if no type column available
-        fig_map = px.scatter_mapbox(
+        fig_map = px.scatter_map(
             assigned_providers,
             lat='Latitude',
             lon='Longitude',
             size='Cost',
             hover_data=hover_columns,
             title="Geographic Distribution of Selected Providers",
-            mapbox_style="open-street-map",
             height=600
         )
     
+    # Center the map on the data
     fig_map.update_layout(
-        mapbox_center_lat=assigned_providers['Latitude'].mean(),
-        mapbox_center_lon=assigned_providers['Longitude'].mean(),
-        mapbox_zoom=8
+        map_center_lat=assigned_providers['Latitude'].mean(),
+        map_center_lon=assigned_providers['Longitude'].mean(),
+        map_zoom=8
     )
     
     st.plotly_chart(fig_map, use_container_width=True)
