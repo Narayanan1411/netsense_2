@@ -1,0 +1,28 @@
+ValueError: Value of 'hover_data_1' is not the name of a column in 'data_frame'. Expected one of ['ProviderId', 'Source', 'Location', 'Contact Number', 'Type', 'Latitude', 'Longitude', 'CMS Rating', 'Availability', 'Cost'] but received: CMS_Rating
+Traceback:
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/exec_code.py", line 128, in exec_func_with_error_handling
+    result = func()
+             ^^^^^^
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/streamlit/runtime/scriptrunner/script_runner.py", line 669, in code_to_exec
+    exec(code, module.__dict__)  # noqa: S102
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/runner/workspace/app.py", line 532, in <module>
+    main()
+File "/home/runner/workspace/app.py", line 105, in main
+    display_results()
+File "/home/runner/workspace/app.py", line 226, in display_results
+    display_geographic_view(results, data)
+File "/home/runner/workspace/app.py", line 307, in display_geographic_view
+    fig_map = px.scatter_mapbox(
+              ^^^^^^^^^^^^^^^^^^
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/plotly/express/_chart_types.py", line 1452, in scatter_mapbox
+    return make_figure(args=locals(), constructor=go.Scattermapbox)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/plotly/express/_core.py", line 2491, in make_figure
+    args = build_dataframe(args, constructor)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/plotly/express/_core.py", line 1737, in build_dataframe
+    df_output, wide_id_vars = process_args_into_dataframe(
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+File "/home/runner/workspace/.pythonlibs/lib/python3.11/site-packages/plotly/express/_core.py", line 1338, in process_args_into_dataframe
+    raise ValueError(err_msg)

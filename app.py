@@ -303,14 +303,22 @@ def display_geographic_view(results, data):
         st.warning("Provider coordinates not available for geographic visualization")
         return
     
-    # Create map
+    # Create map - check for correct column names
+    hover_columns = []
+    if 'ProviderId' in assigned_providers.columns:
+        hover_columns.append('ProviderId')
+    if 'CMS_Rating' in assigned_providers.columns:
+        hover_columns.append('CMS_Rating')
+    elif 'CMS Rating' in assigned_providers.columns:
+        hover_columns.append('CMS Rating')
+    
     fig_map = px.scatter_mapbox(
         assigned_providers,
         lat='Latitude',
         lon='Longitude',
         color='ProviderType',
         size='Cost',
-        hover_data=['ProviderId', 'CMS_Rating'],
+        hover_data=hover_columns,
         title="Geographic Distribution of Selected Providers",
         mapbox_style="open-street-map",
         height=600
